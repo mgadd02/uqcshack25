@@ -51,10 +51,12 @@ class ProcessTab(QtWidgets.QWidget):
         # Controls row 2 (solver options)
         row2 = QtWidgets.QHBoxLayout()
         self.solver_mode = QtWidgets.QComboBox(); self.solver_mode.addItems(["moves", "continuous"])
-        self.moves_algo = QtWidgets.QComboBox(); self.moves_algo.addItems(["A*", "Dijkstra", "Greedy", "BFS"])
+        # Include “funny” algorithms
+        self.moves_algo = QtWidgets.QComboBox()
+        self.moves_algo.addItems(["A*", "Dijkstra", "Greedy", "BFS", "WorstA*", "ZigZag", "RandomGreedy", "WallHugger"])
         self.grid_dx = QtWidgets.QDoubleSpinBox(); self.grid_dx.setRange(0.05, 2.0); self.grid_dx.setSingleStep(0.05); self.grid_dx.setValue(0.25)
         self.grid_dy = QtWidgets.QDoubleSpinBox(); self.grid_dy.setRange(0.05, 2.0); self.grid_dy.setSingleStep(0.05); self.grid_dy.setValue(0.25)
-        self.safety_px = QtWidgets.QSpinBox(); self.safety_px.setRange(0, 60); self.safety_px.setValue(8)
+        self.safety_px = QtWidgets.QSpinBox(); self.safety_px.setRange(0, 120); self.safety_px.setValue(8)
         self.flex_hearts = QtWidgets.QCheckBox("Flex hearts (continuous)"); self.flex_hearts.setChecked(False)
         self.solver_mode.currentTextChanged.connect(self._on_solver_change)
 
@@ -172,4 +174,4 @@ class ProcessTab(QtWidgets.QWidget):
         else:
             self.crit_label.setText("(no critical grid)")
 
-        self.status.setText(f"{mode.title()} solved. Expression length: {len(expr)} | Overlay saved: {overlay_path}")
+        self.status.setText(f"{mode.title()} solved with {self.moves_algo.currentText() if mode=='moves' else 'continuous'}. Expression length: {len(expr)} | Overlay saved: {overlay_path}")

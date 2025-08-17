@@ -15,12 +15,13 @@ MOVE_DELTAS = {"R":(1,0),"UR":(1,-1),"DR":(1,1),"U":(0,-1),"D":(0,1)}
 
 @dataclass
 class GridSpec:
-    dx_units: float = 0.25      # finer grid by default
+    dx_units: float = 0.25
     dy_units: float = 0.25
-    max_cols: int = 500
-    max_rows: int = 400
+    max_cols: int = 800
+    max_rows: int = 600
 
 def step_term(k: float, a: float, x_at: float) -> str:
+    # k/(1+exp(-a*(x+c))) with x_at = -c => c = -x_at
     return f"{k:.4f}/(1+exp(-{a:.0f}*(x+({-x_at:+.4f}))))"
 
 def diag_params_from_line(xs: float, xe: float, slope_m: float) -> Tuple[float,float,float]:
@@ -91,10 +92,20 @@ def cell_to_xy(board, cell: Tuple[int,int], gs: GridSpec) -> Tuple[float,float]:
     y = board.y_range[0] + r*gs.dy_units
     return (x,y)
 
-def plan_cells(occ: np.ndarray, start_cell: Tuple[int,int], goal_cell: Tuple[int,int], algo: str="A*"):
-    from modules.pathfinding_algos import PLANNERS
-    planner = PLANNERS.get(algo, PLANNERS["A*"])
-    return planner(occ, start_cell, goal_cell)  # [(move, cell), ...]
+def plan_cells(
+    occ: np.ndarray,
+    start_cell: Tuple[int,int],
+    goal_cell: Tuple[int,int],
+    algo: str = "A*",
+    *,
+    allow_soft: bool = False,
+    obstacle_cost: float = 100.0
+):
+    from modules.pathfinding_algos import plan_cells as _plan_cells
+    return _plan_cells(
+        occ, start_cell, goal_cell, algo,
+        allow_soft=allow_soft, obstacle_cost=obstacle_cost
+    )
 
 def _draw_critical_grid(
     occ_plan: np.ndarray,
@@ -161,8 +172,8 @@ def solve_moves_on_components(
     *,
     board,
     roi: np.ndarray,
-    obs_main: np.ndarray,
-    obs_plan: np.ndarray,
+    obs_main: np.ndarray,      # base obstacles+border (tight)
+    obs_plan: np.ndarray,      # dilated for safety (planning)
     obs_contours,
     actors,
     shooter,
@@ -178,14 +189,29 @@ def solve_moves_on_components(
     path_cells: List[Tuple[int,int]] = []
     path_moves: List[str] = []
 
+    def run_plan(start_xy, goal_xy, algo_name: str) -> List[Tuple[str, Tuple[int,int]]]:
+        start = xy_to_cell(board, start_xy, gs, occ)
+        goal  = xy_to_cell(board, goal_xy,  gs, occ)
+        # Try chosen algo first; if it fails, allow soft punching through walls.
+        crumb = plan_cells(occ, start, goal, algo=algo_name, allow_soft=False)
+        if not crumb:
+            crumb = plan_cells(occ, start, goal, algo="A*", allow_soft=True, obstacle_cost=120.0)
+        return crumb
+
     if not enemies_xy:
         start_xy = (shooter.x, shooter.y)
         goal_xy  = (board.x_range[1] - gs.dx_units, shooter.y)
-        start_cell = xy_to_cell(board, start_xy, gs, occ)
-        goal_cell  = xy_to_cell(board, goal_xy,  gs, occ)
-        crumb = plan_cells(occ, start_cell, goal_cell, algo)
-        path_cells = [start_cell] + [cell for (_,cell) in crumb]
-        path_moves = [m for (m,_) in crumb]
+        crumb = run_plan(start_xy, goal_xy, algo)
+        if crumb:
+            path_cells = [xy_to_cell(board, start_xy, gs, occ)] + [cell for (_,cell) in crumb]
+            path_moves = [m for (m,_) in crumb]
+        else:
+            # As a last resort: random greedy toward the right edge
+            from modules.pathfinding_algos import random_greedy
+            s = xy_to_cell(board, start_xy, gs, occ); g = xy_to_cell(board, goal_xy, gs, occ)
+            crumb = random_greedy(occ, s, g)
+            path_cells = [s] + [cell for (_,cell) in crumb]
+            path_moves = [m for (m,_) in crumb]
     else:
         cols = group_enemies_by_x(enemies_xy, start_x=shooter.x, x_tol=X_GROUP_TOL)
         cur_xy = (shooter.x, shooter.y)
@@ -193,31 +219,31 @@ def solve_moves_on_components(
         path_cells.append(cur_cell)
         for col in cols:
             xcol = float(np.mean([x for (x,_) in col]))
-            x_pre  = xcol - 0.35
-            x_post = xcol + 0.25
+            x_pre  = xcol - X_PRE_EPS
+            x_post = xcol + X_POST_EPS
             remaining = col[:]
             while remaining:
                 remaining.sort(key=lambda p: abs(p[1] - cur_xy[1]))
                 ex, ey = remaining.pop(0)
 
-                goal1_cell = xy_to_cell(board, (x_pre, ey), gs, occ)
-                crumb1 = plan_cells(occ, cur_cell, goal1_cell, algo)
+                crumb1 = run_plan(cur_xy, (x_pre, ey), algo)
                 if not crumb1:
                     continue
                 path_moves.extend([m for (m,_) in crumb1])
                 path_cells.extend([cell for (_,cell) in crumb1])
                 cur_cell = path_cells[-1]; cur_xy = cell_to_xy(board, cur_cell, gs)
 
-                goal2_cell = xy_to_cell(board, (x_post, cur_xy[1]), gs, occ)
-                crumb2 = plan_cells(occ, cur_cell, goal2_cell, algo)
+                crumb2 = run_plan(cur_xy, (x_post, cur_xy[1]), algo)
                 if crumb2:
                     path_moves.extend([m for (m,_) in crumb2])
                     path_cells.extend([cell for (_,cell) in crumb2])
                     cur_cell = path_cells[-1]; cur_xy = cell_to_xy(board, cur_cell, gs)
 
+    # Convert path to xy for expression + ROI overlay
     path_xy = [cell_to_xy(board, c, gs) for c in path_cells]
     expr = moves_to_expression(path_moves, (shooter.x, shooter.y), gs)
 
+    # ---------- ROI overlay (real image) ----------
     overlay = roi.copy()
     if obs_contours:
         cv2.drawContours(overlay, obs_contours, -1, (0,255,0), 2)
@@ -242,11 +268,7 @@ def solve_moves_on_components(
         for i in range(1, len(pts_px)):
             cv2.line(overlay, pts_px[i-1], pts_px[i], (0,0,255), 2)
 
-    if overlay_path:
-        try: cv2.imwrite(overlay_path, overlay)
-        except Exception: pass
-
-    # Build occ from original (tight) obs for display (light-green layer)
+    # ---------- Critical-pixels grid ----------
     occ_main = make_occ_grid(board, obs_main, gs)
 
     allies_cells = []
