@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 import threading
 import time
 
@@ -34,7 +34,7 @@ class WinInfo:
     pid: int
     exe: str  # lowercased process name
 
-def list_windows() -> List[WinInfo]:
+def list_windows() -> List["WinInfo"]:
     out: List[WinInfo] = []
 
     def cb(hwnd, _):
@@ -87,7 +87,6 @@ class DXRegionCapture:
             raise RuntimeError("dxcam not installed. pip install dxcam")
         l, t, r, b = win32gui.GetWindowRect(hwnd)
         self._dx = dxcam.create(output_idx=0, max_buffer_len=8)  # keep latency low
-        # capture faster; UI can still render ~30 FPS
         self._dx.start(target_fps=60, region=(l, t, r, b))
         self._running = True
         threading.Thread(target=self._loop, daemon=True).start()
@@ -142,7 +141,6 @@ class WGCCapture:
         self.stop()
         self._title = title
         self._running = True
-        # Run in worker thread; wrapper creates its own capture thread internally too.
         self._thread = threading.Thread(target=self._worker, name="WGCWorker", daemon=True)
         self._thread.start()
 
@@ -150,14 +148,14 @@ class WGCCapture:
         try:
             cap = WindowsCapture(window_name=self._title,
                                  cursor_capture=False,
-                                 draw_border=True,  # keep ON for reliability
+                                 draw_border=True,
                                  monitor_index=None)
             @cap.event
             def on_frame_arrived(frame, control):
                 try:
                     buf = frame.frame_buffer  # BGRA
                     rgb = buf[:, :, :3][:, :, ::-1]  # -> RGB
-                    # Lightweight downscale to reduce UI work if huge:
+                    # Light downscale if huge
                     h, w, _ = rgb.shape
                     if w > 1280:
                         import cv2
@@ -175,11 +173,10 @@ class WGCCapture:
 
             cap.start()
             self._cap = cap
-            # keep thread alive
             while self._running and self._cap is not None:
                 time.sleep(0.05)
         except Exception as e:
-            # Surface a diagnostic image so UI shows something helpful
+            import numpy as np
             img = np.zeros((240, 800, 3), dtype=np.uint8)
             try:
                 import cv2
@@ -208,14 +205,14 @@ class WGCCapture:
             return self._last.copy()
 
 
-# ---------- Facade used by the UI ----------
+# ---------- Facade ----------
 
 class CaptureController:
     """
     Simple facade the UI uses. You pick backend + window; it exposes latest() frame.
     """
     def __init__(self):
-        self.backend = "DXCAM"  # default; use DX region for stability/latency
+        self.backend = "DXCAM"
         self.dx = DXRegionCapture()
         self.wgc = WGCCapture()
 
@@ -230,8 +227,6 @@ class CaptureController:
         if self.backend == "DXCAM":
             self.dx.start(win.hwnd)
         else:
-            # WGC is title-based; if multiple windows share title, it may pick wrong one.
-            # Prefer choosing the exact Java window in the picker.
             self.wgc.start(win.title)
 
     def stop(self):

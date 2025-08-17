@@ -1,7 +1,6 @@
+from typing import Optional
 from PyQt5 import QtWidgets, QtGui, QtCore
 import numpy as np
-from typing import Optional
-
 
 from modules.capture_backends import (
     list_windows, WinInfo, CaptureController
@@ -88,7 +87,7 @@ class LiveViewTab(QtWidgets.QWidget):
             self.window_combo.setCurrentIndex(idx)
         self.window_combo.blockSignals(False)
 
-    def _selected_win(self) -> WinInfo:
+    def _selected_win(self) -> Optional[WinInfo]:
         return self.window_combo.currentData()
 
     def start_capture(self):
@@ -109,13 +108,10 @@ class LiveViewTab(QtWidgets.QWidget):
         if frm is None:
             self.preview.setText("(no frame yet — if WGC, ensure window is not minimized)")
             return
-        # Convert NumPy RGB -> QImage
         h, w, _ = frm.shape
-        # Scale to widget
         pw, ph = max(200, self.preview.width()), max(200, self.preview.height())
         scale = min(pw / w, ph / h)
         tw, th = max(1, int(w * scale)), max(1, int(h * scale))
-        # Convert & show
         qimg = QtGui.QImage(frm.data, w, h, w * 3, QtGui.QImage.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg).scaled(tw, th, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         self.preview.setPixmap(pix)

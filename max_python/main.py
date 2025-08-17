@@ -8,21 +8,26 @@ class GraphwarBotUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Graphwar Bot — Capture + Solver")
-        self.resize(1200, 800)
+        self.resize(1280, 860)
 
-        # Output tab first (so ProcessTab can push text there)
         self.shot_output = ShotOutputTab()
-
-        # Live view and processing
         self.live_view = LiveViewTab()
-        self.process_tab = ProcessTab(get_frame_func=self.live_view.get_latest_frame,
-                                      set_output_func=self.shot_output.set_text)
+
+        self.process_tab = ProcessTab(
+            get_frame_func=self.live_view.get_latest_frame,
+            set_output_func=self.shot_output.set_text,
+            get_save_dir_func=self._get_default_save_dir
+        )
 
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self.live_view, "Live View")
         tabs.addTab(self.process_tab, "Process")
         tabs.addTab(self.shot_output, "Shot Output")
         self.setCentralWidget(tabs)
+
+    def _get_default_save_dir(self) -> str:
+        # Use the current working directory as a default folder for overlays
+        return "."
 
     def closeEvent(self, e):
         try:
