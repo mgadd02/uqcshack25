@@ -1,23 +1,24 @@
 # modules/solver_engine.py
 #!/usr/bin/env python3
-import math
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
-
+from typing import Tuple, Optional, Dict, List, Callable
+import math
 import numpy as np
 import cv2
 
-# ---- Tunables ----
-ENEMY_RADIUS       = 0.8
-X_GROUP_TOL        = 0.6
-BORDER_THICK_PX    = 8
-INFLATE_PX         = 2     # baseline thickness for raw obstacles (not the safety margin)
+# ---------- Public knobs (bumped padding/tolerance as requested) ----------
+DEFAULT_BORDER_PX      = 16
+DEFAULT_INFLATE_MAIN   = 10   # hard collision padding
+DEFAULT_INFLATE_TOL    = 20   # extra tolerance for planning/visual (dark green)
+DEFAULT_MIN_THICK_PX   = 9.0
+DEFAULT_MIN_OBS_AREA   = 220
+DEFAULT_SHRINK_STEPS   = 6
 
-# NEW: pre-filter thresholds to remove tiny / thin components (e.g., text)
-MIN_OBS_AREA_PX    = 150   # drop components smaller than this pixel area
-MIN_OBS_THICK_PX   = 6.0   # drop components whose distance-transform thickness < this
+ENEMY_RADIUS = 0.8
 
-# ---------------- Data ----------------
+ProgressCB = Optional[Callable[[str, int, str], bool]]
+
+# ---------- Data ----------
 @dataclass
 class Board:
     x0: int; y0: int; w: int; h: int
@@ -51,81 +52,76 @@ def find_board_roi(img_bgr: np.ndarray) -> Tuple['Board', np.ndarray]:
     board = Board(x0=x, y0=y, w=w, h=h, x_range=(-25.0, 25.0), y_range=(-15.0, 15.0))
     return board, roi
 
-# ---------- Obstacles ----------
-def _remove_axes(mask: np.ndarray) -> np.ndarray:
-    edges = cv2.Canny(mask, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=200,
-                            minLineLength=int(0.5*mask.shape[1]), maxLineGap=10)
-    if lines is not None:
-        for x1,y1,x2,y2 in lines[:,0]:
-            cv2.line(mask, (x1,y1), (x2,y2), 0, 5)
-    return mask
+# ---------- Label-aware small/noisy obstacle filtering ----------
+def detect_white_labels(roi_bgr: np.ndarray) -> List[Tuple[int,int,int,int]]:
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([0, 0, 185]), np.array([179, 120, 255]))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes=[]
+    for c in contours:
+        x,y,w,h = cv2.boundingRect(c)
+        area = w*h
+        ar = w/max(1,h)
+        if 100<=area<=20000 and ar>=1.03:
+            boxes.append((x,y,w,h))
+    return boxes
 
-def _filter_small_and_thin(mask: np.ndarray,
-                           min_area_px: int = MIN_OBS_AREA_PX,
-                           min_thick_px: float = MIN_OBS_THICK_PX) -> np.ndarray:
-    """
-    Keep only components that look like real obstacles:
-      - area >= min_area_px
-      - OR have enough thickness by distance transform (>= min_thick_px)
-    This removes text-like specks before any padding.
-    """
-    # Connected components
-    num, labels = cv2.connectedComponents(mask)
-    if num <= 1:
-        return mask
+def remove_thin_dark_near_labels(obstacles_mask: np.ndarray, roi_bgr: np.ndarray,
+                                 pad:int=24, dilate:int=50) -> np.ndarray:
+    boxes = detect_white_labels(roi_bgr)
+    if not boxes:
+        return obstacles_mask
+    er = cv2.erode(obstacles_mask, np.ones((3,3), np.uint8), iterations=1)
+    thin = cv2.bitwise_and(obstacles_mask, cv2.bitwise_not(er))
+    region = np.zeros_like(obstacles_mask)
+    for (x,y,w,h) in boxes:
+        x0=max(0,x-pad); y0=max(0,y-pad)
+        x1=min(obstacles_mask.shape[1]-1, x+w+pad); y1=min(obstacles_mask.shape[0]-1, y+h+pad)
+        cv2.rectangle(region,(x0,y0),(x1,y1),255,thickness=cv2.FILLED)
+    if dilate>0:
+        k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*dilate+1,2*dilate+1))
+        region=cv2.dilate(region,k,iterations=1)
+    cleaned = obstacles_mask.copy()
+    cleaned[(region>0) & (thin>0)] = 0
+    return cleaned
 
-    keep = np.zeros_like(mask)
-    h, w = mask.shape[:2]
-
+def _keep_by_thickness(shape_mask: np.ndarray, min_thick_px: float, min_area: int) -> np.ndarray:
+    num, labels = cv2.connectedComponents(shape_mask)
+    keep = np.zeros_like(shape_mask)
     for i in range(1, num):
         comp = np.uint8(labels == i) * 255
         area = int((comp > 0).sum())
-        if area < min_area_px:
-            # maybe still keep if it's actually thick (e.g., tiny dense chunk)
-            dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
-            thick = float(dist.max())
-            if thick >= min_thick_px:
-                keep = cv2.bitwise_or(keep, comp)
+        if area < min_area:
             continue
-
-        # if area ok, also check thickness to avoid text strokes
+        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cnt = max(cnts, key=cv2.contourArea)
+        per = cv2.arcLength(cnt, True)
+        circularity = 4 * math.pi * cv2.contourArea(cnt) / (per * per + 1e-9)
         dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
         thick = float(dist.max())
-        if thick >= min_thick_px:
+        if thick >= min_thick_px or (circularity >= 0.60 and area >= max(150, min_area)):
             keep = cv2.bitwise_or(keep, comp)
-        else:
-            # Optional: allow “large but thin” curved blobs if quite round
-            cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                cnt = max(cnts, key=cv2.contourArea)
-                per = cv2.arcLength(cnt, True)
-                circ = 4 * math.pi * cv2.contourArea(cnt) / (per * per + 1e-9)
-                if circ >= 0.60 and area >= (min_area_px * 1.5):
-                    keep = cv2.bitwise_or(keep, comp)
-
     return keep
 
-def obstacle_mask_and_contours(roi_bgr: np.ndarray):
+def obstacle_mask_and_contours(roi_bgr: np.ndarray,
+                               min_thick_px: float,
+                               min_area: int) -> Tuple[np.ndarray, List[np.ndarray]]:
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     v = hsv[:,:,2]
-    # initial “black fill” detection
-    mask = np.uint8((v < 60) * 255)
-    # light clean
+    mask = np.uint8((v < 60) * 255)          # true black fill only
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8), iterations=1)
-    # drop axes
-    mask = _remove_axes(mask)
-    # *** NEW: remove tiny / thin components BEFORE any padding ***
-    mask = _filter_small_and_thin(mask, MIN_OBS_AREA_PX, MIN_OBS_THICK_PX)
-
+    mask = remove_thin_dark_near_labels(mask, roi_bgr, pad=24, dilate=50)
+    mask = _keep_by_thickness(mask, min_thick_px=min_thick_px, min_area=min_area)
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     clean = np.zeros_like(mask)
-    if contours:
-        cv2.drawContours(clean, contours, -1, 255, thickness=cv2.FILLED)
+    cv2.drawContours(clean, contours, -1, 255, thickness=cv2.FILLED)
     return clean, contours
 
-def add_border_mask(shape: Tuple[int,int], px:int=BORDER_THICK_PX)->np.ndarray:
+def add_border_mask(shape: Tuple[int,int], px:int)->np.ndarray:
     h,w = shape
     border = np.zeros((h,w), dtype=np.uint8)
     cv2.rectangle(border,(0,0),(w-1,h-1),255,thickness=px)
@@ -158,7 +154,6 @@ def classify_by_center(actors: List[Actor])->None:
     for a in actors:
         a.side = "ally" if a.x<0 else "enemy"
 
-# ---------- Shooter ----------
 def red_mask(roi_bgr: np.ndarray)->np.ndarray:
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     m1 = cv2.inRange(hsv, np.array([0,60,70]),   np.array([12,255,255]))
@@ -196,7 +191,7 @@ def choose_shooter_by_red_ring(roi_bgr: np.ndarray, actors: List[Actor])->Option
 def choose_leftmost(actors: List[Actor])->Optional[Actor]:
     return min(actors, key=lambda t:t.x) if actors else None
 
-# ---------- Public: unified solver entry ----------
+# ---------- Entry point used by UI ----------
 def solve_from_bgr(
     bgr: np.ndarray,
     *,
@@ -204,96 +199,78 @@ def solve_from_bgr(
     y_range: Tuple[float,float]=(-15.0,15.0),
     min_area: int=60,
     overlay_path: Optional[str]=None,
-    solver_mode: str = "moves",       # default to moves for now
-    grid_dx: float = 0.25,            # finer grid
+    # moves planner knobs from UI
+    grid_dx: float = 0.25,
     grid_dy: float = 0.25,
-    moves_algo: str = "A*",
-    flex: bool = False,               # ignored by moves
-    moves_safety_px: int = 8          # BIGGER default safety ring
+    algo: str = "A*",
+    targeting_mode: str = "x-first",
+    allow_soft_fallback: bool = True,
+    # padding / tolerance
+    inflate_main_px: int = DEFAULT_INFLATE_MAIN,
+    inflate_tol_px: int  = DEFAULT_INFLATE_TOL,
+    border_px: int       = DEFAULT_BORDER_PX,
+    min_obstacle_area: int = DEFAULT_MIN_OBS_AREA,
+    min_thickness_px: float = DEFAULT_MIN_THICK_PX,
+    shrink_steps: int = DEFAULT_SHRINK_STEPS,
+    # progress
+    progress_cb: ProgressCB = None
 ) -> dict:
-    if solver_mode.lower() == "moves":
-        # Prepare SAME components as continuous
-        board, roi = find_board_roi(bgr)
-        board.x_range = x_range; board.y_range = y_range
-
-        # obstacles (now pre-filtered)
-        obs_raw, obs_contours = obstacle_mask_and_contours(roi)
-        border_only = add_border_mask(obs_raw.shape, px=BORDER_THICK_PX)
-
-        # inflate ONLY obstacles first, then OR with border (baseline, still tight)
-        obs_infl_main = inflate(obs_raw, INFLATE_PX)
-        obs_main      = cv2.bitwise_or(obs_infl_main, border_only)
-
-        # --- Planning safety: dilate obs+border (so planner keeps extra distance) ---
-        safety_px = int(max(0, moves_safety_px))
-        if safety_px > 0:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*safety_px+1, 2*safety_px+1))
-            obs_plan = cv2.dilate(obs_main, k, iterations=1)
-        else:
-            obs_plan = obs_main.copy()
-
-        # actors & shooter
-        actors = detect_actors(roi, min_area=min_area)
-        assign_coords(board, actors); classify_by_center(actors)
-        shooter = choose_shooter_by_red_ring(roi, actors)
-        if shooter is None:
-            left_allies=[a for a in actors if a.side=="ally"]
-            shooter = choose_leftmost(left_allies) or choose_leftmost(actors)
-        if shooter is None:
-            raise RuntimeError("No actors detected.")
-
-        # moves solver on shared components
-        from modules.moves_solver import solve_moves_on_components
-        res = solve_moves_on_components(
-            board=board,
-            roi=roi,
-            obs_main=obs_main,
-            obs_plan=obs_plan,
-            obs_contours=obs_contours,
-            actors=actors,
-            shooter=shooter,
-            grid_dx=grid_dx,
-            grid_dy=grid_dy,
-            algo=moves_algo,
-            overlay_path=overlay_path
-        )
-        out_actors=[{"x":float(a.x),"y":float(a.y),"side":a.side,"is_shooter":(a is shooter)} for a in actors]
-        return {
-            "actors": out_actors,
-            "expr": res["expr"],
-            "overlay_bgr": res["overlay_bgr"],               # ROI overlay
-            "crit_overlay_bgr": res.get("crit_overlay_bgr")  # critical pixels grid
-        }
-
-    # ---------------- Minimal continuous stub (unchanged) ----------------
     board, roi = find_board_roi(bgr)
     board.x_range = x_range; board.y_range = y_range
-    obs_raw, obs_contours = obstacle_mask_and_contours(roi)
-    border_only = add_border_mask(obs_raw.shape, px=BORDER_THICK_PX)
-    obs_infl_main = inflate(obs_raw, INFLATE_PX)
-    obs_main = cv2.bitwise_or(obs_infl_main, border_only)
+
+    if progress_cb and not progress_cb("Detecting obstacles", 2, "thresholds"):
+        return {"expr":"0"}
+    obs_raw, obs_contours = obstacle_mask_and_contours(
+        roi,
+        min_thick_px=min_thickness_px,
+        min_area=min_obstacle_area
+    )
+
+    border_only = add_border_mask(obs_raw.shape, px=border_px)
+
+    # Inflate only obstacles, then OR with border
+    obs_hard = cv2.bitwise_or(inflate(obs_raw, inflate_main_px), border_only)
+    obs_plan = cv2.bitwise_or(inflate(obs_raw, inflate_tol_px),  border_only)
+
+    # Optional shrink (not used directly, kept for future tuning)
+    if shrink_steps > 0:
+        k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
+        cur=obs_raw.copy()
+        for _ in range(shrink_steps):
+            cur=cv2.erode(cur,k,iterations=1)
+
+    if progress_cb and not progress_cb("Detecting actors", 8, "players & shooter"):
+        return {"expr":"0"}
 
     actors = detect_actors(roi, min_area=min_area)
     assign_coords(board, actors); classify_by_center(actors)
-    shooter = choose_leftmost([a for a in actors if a.side == "ally"]) or (actors[0] if actors else None)
-    expr = "0"
+    shooter = choose_shooter_by_red_ring(roi, actors)
+    if shooter is None:
+        left_allies=[a for a in actors if a.side=="ally"]
+        shooter = choose_leftmost(left_allies) or choose_leftmost(actors)
+    if shooter is None:
+        raise RuntimeError("No actors detected.")
 
-    overlay = roi.copy()
-    if obs_contours: cv2.drawContours(overlay, obs_contours, -1, (0,255,0), 2)
-    h,w = obs_main.shape[:2]; cv2.rectangle(overlay,(0,0),(w-1,h-1),(0,255,0),2)
-    for a in actors:
-        if a is shooter:
-            cv2.circle(overlay,(a.px,a.py),18,(0,215,255),3)
-            cv2.putText(overlay,"S",(a.px+10,a.py-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,215,255),2,cv2.LINE_AA)
-        else:
-            color=(0,0,255) if a.side=="enemy" else (255,0,0)
-            label="E" if a.side=="enemy" else "A"
-            cv2.circle(overlay,(a.px,a.py),6,color,2)
-            cv2.putText(overlay,label,(a.px+8,a.py-8),cv2.FONT_HERSHEY_SIMPLEX,0.5,color,1,cv2.LINE_AA)
+    # ----- Moves-based planner -----
+    from modules.moves_solver import solve_moves_on_components as _solve_moves
+    res = _solve_moves(
+        board=board,
+        roi=roi,
+        obs_main=obs_hard,           # hard (light green)
+        obs_plan=obs_plan,           # tolerant (dark green)
+        obs_contours=obs_contours,
+        actors=actors,
+        shooter=shooter,
+        grid_dx=grid_dx,
+        grid_dy=grid_dy,
+        algo=algo,
+        targeting_mode=targeting_mode,
+        allow_soft_fallback=allow_soft_fallback,
+        overlay_path=overlay_path,
+        progress=progress_cb
+    )
 
-    if overlay_path:
-        try: cv2.imwrite(overlay_path, overlay)
-        except Exception: pass
+    if overlay_path and res.get("overlay_bgr") is not None:
+        cv2.imwrite(overlay_path, res["overlay_bgr"])
 
-    out_actors=[{"x":float(a.x),"y":float(a.y),"side":a.side,"is_shooter":(a is shooter)} for a in actors]
-    return {"actors": out_actors, "expr": expr, "overlay_bgr": overlay}
+    return res
